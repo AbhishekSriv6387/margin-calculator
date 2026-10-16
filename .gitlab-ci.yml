@@ -1,0 +1,7 @@
+# Runs the automated tests on every push and merge request.
+test:
+  image: python:3.12-slim
+  script:
+    - cd backend
+    - pip install -r requirements-dev.txt
+    - python -m pytest -q
