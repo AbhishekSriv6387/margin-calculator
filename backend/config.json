@@ -1,0 +1,1 @@
+{"currency": "INR", "unit_label": "per hour", "margin_warn_below": 20, "margin_good_from": 30, "hours_per_day": 8, "genus_change_flag_pct": 25, "max_rate": 100000, "max_genus": 100000, "max_exp": 60, "max_alloc": 1, "solver_max_uplift_pct": 15}

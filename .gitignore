@@ -1,0 +1,13 @@
+# local data and secrets: never commit these
+backend/data/*.db
+backend/data/feedback.jsonl
+backend/data/.session_secret
+backend/.env
+.env
+*.zip
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
