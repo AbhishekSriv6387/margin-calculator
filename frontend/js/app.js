@@ -101,7 +101,7 @@ function render(){
   $('app').innerHTML=`<div class="app-shell">
     <header class="topbar"><div class="topbar-in">
       <a class="brand" href="/" onclick="event.preventDefault();go('calc')" aria-label="Margin Calculator, home"><img class="logo" src="/static/img/nagarro-logo.png" alt="Nagarro"><span class="brand-name">Margin Calculator</span></a>
-      <nav class="nav" aria-label="Main">${NAV_MAIN.map(item).join('')}${adm?`<span class="nav-sep" aria-hidden="true"></span>${NAV_ADMIN.map(item).join('')}`:''}</nav>
+      <nav class="nav${adm?' has-admin':''}" aria-label="Main">${NAV_MAIN.map(item).join('')}${adm?`<span class="nav-sep" aria-hidden="true"></span><button class="nav-item" id="admbtn" title="Admin" aria-haspopup="menu" aria-expanded="false" onclick="toggleAdminMenu()">${I('audit',17)}<span>Admin</span>${I('chev',13)}</button>`:''}</nav>
       <div class="top-right">
         <label class="switch top-switch" title="Hide cost and margin figures on screen"><input type="checkbox" id="hc" ${hideCost()?'checked':''} onchange="setHideCost(this.checked)"><i></i><span>Hide cost</span></label>
         <div class="user-menu"><button class="avatar" id="avatar" aria-haspopup="menu" aria-expanded="false" aria-label="Account menu" onclick="toggleMenu()"><b>${esc(initials(U.email))}</b>${I('chev',14)}</button></div>
@@ -112,16 +112,37 @@ function render(){
 function toggleMenu(force){
   const open=$('umenu');
   if(open||force===false){open?.remove();$('avatar')?.setAttribute('aria-expanded','false');return}
+  toggleAdminMenu(false);
   const d=document.createElement('div');d.className='menu';d.id='umenu';d.setAttribute('role','menu');
   d.innerHTML=`<div class="menu-who"><span class="em" title="${esc(U.email)}">${esc(U.email)}</span><span class="chip plain ${U.role=='admin'?'admin':''}">${esc(U.role)}</span></div><button role="menuitem" onclick="toggleMenu(false);feedbackDlg()">${I('chat',16)}Send feedback</button><a class="menu-link" role="menuitem" href="${DECK}" target="_blank" rel="noopener" download>${I('download',16)}Overview presentation (PPT)</a><button role="menuitem" onclick="logout()">${I('out',16)}Sign out</button>`;
   document.querySelector('.user-menu').appendChild(d);$('avatar').setAttribute('aria-expanded','true');d.querySelector('button').focus()}
-document.addEventListener('click',e=>{if($('umenu')&&!e.target.closest('.user-menu'))toggleMenu(false)});
-document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('umenu')){toggleMenu(false);$('avatar')?.focus()}});
+/* admin pages (Holidays, Users, Audit log) live in one menu so the header never runs out of room */
+const ADM_TABS=NAV_ADMIN.map(x=>x[0]);
+function toggleAdminMenu(force){
+  const open=$('admenu'),btn=$('admbtn');
+  if(open||force===false){open?.remove();btn?.setAttribute('aria-expanded','false');return}
+  toggleMenu(false);
+  const r=btn.getBoundingClientRect(),d=document.createElement('div');
+  d.className='menu adm-menu';d.id='admenu';d.setAttribute('role','menu');
+  d.innerHTML=NAV_ADMIN.map(([k,l,i])=>`<button role="menuitem" data-tab="${k}" class="${k==tab?'on':''}" onclick="toggleAdminMenu(false);go('${k}')">${I(i,16)}${l}</button>`).join('');
+  d.style.top=Math.round(r.bottom+6)+'px';
+  document.body.appendChild(d);
+  d.style.left=Math.max(8,Math.min(Math.round(r.left),innerWidth-d.offsetWidth-8))+'px';
+  btn.setAttribute('aria-expanded','true');d.querySelector('button').focus()}
+window.addEventListener('resize',()=>toggleAdminMenu(false));
+document.addEventListener('click',e=>{
+  if($('umenu')&&!e.target.closest('.user-menu'))toggleMenu(false);
+  if($('admenu')&&!e.target.closest('#admbtn')&&!e.target.closest('#admenu'))toggleAdminMenu(false)});
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape')return;
+  if($('umenu')){toggleMenu(false);$('avatar')?.focus()}
+  if($('admenu')){toggleAdminMenu(false);$('admbtn')?.focus()}});
 async function go(t){
   tab=t;
   const label=[...NAV_MAIN,...NAV_ADMIN].find(x=>x[0]==t)?.[1]||'';document.title=(label?label+' · ':'')+'Margin Calculator';
   document.querySelectorAll('.nav-item').forEach(b=>{const on=b.dataset.tab==t;b.classList.toggle('on',on);on?b.setAttribute('aria-current','page'):b.removeAttribute('aria-current')});
-  toggleMenu(false);await flushAll();
+  const ab=$('admbtn');if(ab){const on=ADM_TABS.includes(t);ab.classList.toggle('on',on);on?ab.setAttribute('aria-current','page'):ab.removeAttribute('aria-current')}
+  toggleMenu(false);toggleAdminMenu(false);await flushAll();
   if(curTeam==null&&['calc','teams','insights'].includes(t)){welcome();return}
   if(t!='calc'&&t!='guide')$('body').innerHTML='<div class="loading" role="status">Loading…</div>';   /* pages that fetch data show this until they are ready */
   await (PAGES[t]||PAGES.audit)();
