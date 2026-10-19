@@ -4,14 +4,15 @@
    ========================================================================== */
 const stChip=s=>`<span class="chip ${({active:'green',pending:'amber',rejected:'red'})[s]||'plain'}">${esc(s[0].toUpperCase()+s.slice(1))}</span>`;
 
+let GV=[];   /* the versions on screen, so the approve dialog can name the country */
 async function drawGenus(){
-  const v=await J('/api/genus/versions'),A=U.role=='admin';
-  $('body').innerHTML=`${head('Genus tables','Cost tables used to price every role, shared by all teams. New uploads stay pending until a different admin approves them.',
+  const v=await J('/api/genus/versions'),AP=!!C.genus_approval,A=U.role=='admin'||!AP;GV=v;   /* A: may activate / roll back (everyone who can upload, unless approval is switched on) */
+  $('body').innerHTML=`${head('Genus tables',`Cost tables used to price every role. Each country has its own table in its own currency, shared by all teams in that country. ${AP?'New uploads stay pending until a different admin approves them.':'An uploaded table becomes active for its country straight away.'}`,
     `<button class="btn" onclick="reprice()">${I('reset',16)}Re-price ${U.role=='admin'?'all teams':'my teams'}</button><button class="btn primary" onclick="gimp.click()">${I('upload',16)}Upload new table</button><input type="file" id="gimp" hidden accept=".xlsx" onchange="gUp(this)">`)}
   <section class="panel"><div class="panel-head"><div><h2>Versions</h2><p>Costs are only as verified as the file that was uploaded. To roll back, activate an older version.</p></div></div>
-    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Version</th><th>Status</th><th class="n">Rows</th><th>Uploaded by</th><th>Report</th><th></th></tr></thead><tbody>
+    <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Version</th><th>Country</th><th>Status</th><th class="n">Rows</th><th>Uploaded by</th><th>Report</th><th></th></tr></thead><tbody>
     ${v.map(x=>`<tr><td class="wrap"><b>#${x.id}</b> ${esc(x.label)}<span class="sub-line">${esc(x.at.slice(0,16).replace('T',' '))}</span></td>
-      <td>${stChip(x.status)}${x.decided_by?`<span class="sub-line">by ${esc(x.decided_by)}</span>`:''}</td><td class="n">${x.rows}</td><td>${esc(x.by)}</td>
+      <td class="role">${esc(x.country)} <span class="tag ccy">${esc(x.currency)}</span>${x.locations&&x.locations.length?`<span class="sub-line">${esc(x.locations.slice(0,4).join(', '))}${x.locations.length>4?` +${x.locations.length-4} more`:''}</span>`:''}</td><td>${stChip(x.status)}${x.decided_by?`<span class="sub-line">by ${esc(x.decided_by)}</span>`:''}</td><td class="n">${x.rows}</td><td>${esc(x.by)}</td>
       <td>${x.report?.rejected_count?`<span class="amber">${x.report.rejected_count} rows rejected</span>`:'<span class="mu">Clean</span>'}</td>
       <td class="n">${x.status=='pending'||x.status=='archived'?`<button class="btn sm" onclick="diffV(${x.id})">Compare with active</button>`:''}
         ${A&&x.status=='pending'?` <button class="btn sm primary" onclick="decide(${x.id},'approve')">Approve</button> <button class="btn sm" onclick="decide(${x.id},'reject')">Reject</button>`:''}
@@ -21,25 +22,27 @@ async function gUp(i){
   if(!i.files[0])return;const fd=new FormData();fd.append('file',i.files[0]);
   const r=await fetch('/api/genus/upload',{method:'POST',body:fd}),j=await r.json().catch(()=>({}));i.value='';
   if(!r.ok)toast(typeof j.detail=='string'?j.detail:'Upload failed','err');
-  else if(j.rejected_count)await dlg({title:'Upload received',body:`${j.accepted} rows accepted and waiting for approval. ${j.rejected_count} rows were rejected.\n\nFirst rejected rows:\n${j.rejected.slice(0,5).join('\n')}`,ok:'Close',cancel:null});
-  else toast(`Uploaded as pending: ${j.accepted} rows accepted`);
+  else{const vs=j.versions||[],multi=vs.length>1,st=j.approval_required?'pending (waiting for approval)':'active now',sv=j.approval_required?'Uploaded as pending':'Uploaded and active';
+    if(j.rejected_count)await dlg({title:'Upload received',body:`${multi?`${vs.length} tables were created, one per country (${st}):\n${vs.map(x=>`${x.country} (${x.currency}): ${x.accepted} rows`).join('\n')}\n\n`:`${j.accepted} rows accepted${vs[0]?` for ${vs[0].country} (${vs[0].currency})`:''}, ${st}. `}${j.rejected_count} rows were rejected.\n\nFirst rejected rows:\n${j.rejected.slice(0,5).join('\n')}`,ok:'Close',cancel:null});
+    else toast(multi?`${sv}: ${vs.length} countries, ${j.accepted} rows`:`${sv}: ${j.accepted} rows accepted${vs[0]?` for ${vs[0].country} (${vs[0].currency})`:''}`);
+    if(!j.approval_required&&j.stale_lines)await dlg({title:'Team costs are out of date',body:`${j.stale_lines} team lines now have a different table cost. Use Re-price to update them.`,ok:'Got it',cancel:null})}
   drawGenus()}
 async function diffV(id){
   const d=await J(`/api/genus/versions/${id}/diff`),fl=d.changed.filter(c=>c.flag).length;
-  $('dif').innerHTML=`<section class="panel"><div class="panel-head"><div><h2>Changes compared with the active table</h2><p>Changes above ${C.genus_change_flag_pct}% are flagged for review.</p></div></div>
+  $('dif').innerHTML=`<section class="panel"><div class="panel-head"><div><h2>Changes compared with the active ${esc(d.country)} table (${esc(d.currency)})</h2><p>Changes above ${C.genus_change_flag_pct}% are flagged for review.</p></div></div>
     <div class="stat-trio"><div class="stat"><span>Added</span><b>${d.added.length}</b></div><div class="stat"><span>Removed</span><b>${d.removed.length}</b></div><div class="stat"><span>Changed</span><b>${d.changed.length}</b></div><div class="stat"><span>Flagged</span><b class="${fl?'red':''}">${fl}</b></div></div>
     <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Genus</th><th class="n">Old</th><th class="n">New</th><th class="n">Change</th></tr></thead><tbody>
     ${d.changed.slice(0,60).map(c=>`<tr><td>${esc(c.key)}</td><td class="n">${f(c.old,2)}</td><td class="n">${f(c.new,2)}</td><td class="n ${c.flag?'red':''}">${c.pct>0?'+':''}${c.pct}%${c.flag?` <span class="warn-ic">${I('warn',15)}</span>`:''}</td></tr>`).join('')||'<tr class="empty-row"><td colspan="4">No cost changes.</td></tr>'}
     </tbody></table></div>${d.changed.length>60?`<p class="note pad">Showing the first 60 of ${d.changed.length} changes.</p>`:''}</section>`;
   $('dif').scrollIntoView({behavior:'smooth',block:'nearest'})}
 async function decide(id,a){
-  const ap=a=='approve';
-  if(!await dlg({title:ap?'Make this the active Genus table?':'Reject this upload?',body:ap?'New calculations will use this version. The current active table is archived.':'This version will not be used.',ok:ap?'Make active':'Reject upload',danger:!ap}))return;
+  const ap=a=='approve',x=GV.find(y=>y.id==id)||{},cn=x.country||'this country';
+  if(!await dlg({title:ap?`Make this the active ${cn} Genus table?`:'Reject this upload?',body:ap?`New calculations for ${cn} teams will use this version${x.currency?`, in ${x.currency}`:''}. The current ${cn} table is archived. Other countries are not affected.`:'This version will not be used.',ok:ap?'Make active':'Reject upload',danger:!ap}))return;
   const r=await send(`/api/genus/versions/${id}/${a}`,'POST');
-  if(ap){G=await J('/api/genus');if(r.stale_lines)await dlg({title:'Team costs are out of date',body:`${r.stale_lines} team lines now have a different table cost. Use Re-price team to update them.`,ok:'Got it',cancel:null})}
+  if(ap){G=await J('/api/genus'+gq());if(r.stale_lines)await dlg({title:'Team costs are out of date',body:`${r.stale_lines} team lines in ${r.country} teams now have a different table cost. Use Re-price team to update them.`,ok:'Got it',cancel:null})}
   drawGenus()}
 async function reprice(){
-  if(!await dlg({title:U.role=='admin'?'Re-price all teams?':'Re-price your teams?',body:`Updates Genus cost and baseline for everyone in ${U.role=='admin'?'every team':'the teams you can see'} whose cost is not overridden, using the active table.`,ok:'Re-price'}))return;
+  if(!await dlg({title:U.role=='admin'?'Re-price all teams?':'Re-price your teams?',body:`Updates Genus cost and baseline for everyone in ${U.role=='admin'?'every team':'the teams you can see'} whose cost is not overridden, using the active Genus table of that team's country.`,ok:'Re-price'}))return;
   const r=await send('/api/team/reprice','POST');UH=[];T=await J('/api/team?'+qs());toast(`${r.changed} ${r.changed==1?'person':'people'} re-priced`)}
 
 async function drawHol(){

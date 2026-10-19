@@ -22,8 +22,8 @@ def test_manager_gets_cost_but_not_admin_endpoints():
 def test_manager_edit_is_audited_and_maker_checker():
     m = client("manager@local"); t = m.get("/api/team").json(); pid = t[0]["id"]
     assert "genus" in t[0]; assert m.patch(f"/api/team/{pid}", json={"rate": 3000}).json()["rate"] == 3000
-    wb = openpyxl.Workbook(); ws = wb.active; ws.append(["ServiceRegion", "Country", "Genus", "Currency", "Genus Cost"])
-    ws.append(["R", "India", "3.1-JAVA", "INR", 1900]); ws.append(["R", "India", "3.1-JAVA", "INR", 1]); ws.append(["R", "India", "9.9-X", "INR", 5])
+    wb = openpyxl.Workbook(); ws = wb.active; ws.append(["ServiceRegion", "Country", "ServiceLocation", "Genus", "Currency", "Genus Cost"])
+    ws.append(["R", "India", "Pune", "3.1-JAVA", "INR", 1900]); ws.append(["R", "India", "Pune", "3.1-JAVA", "INR", 1]); ws.append(["R", "India", "Pune", "9.9-X", "INR", 5])
     b = io.BytesIO(); wb.save(b)
     r = m.post("/api/genus/upload", files={"file": ("g.xlsx", b.getvalue())}).json(); assert r["accepted"] == 1 and r["rejected_count"] == 2
     assert m.post(f"/api/genus/versions/{r['id']}/approve").status_code == 403  # manager cannot approve

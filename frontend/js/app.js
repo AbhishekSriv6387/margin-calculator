@@ -76,14 +76,14 @@ async function init(){
     if(curTeam==null){  // nothing assigned to this user yet
       [G,CAL]=await Promise.all([J('/api/genus'),J('/api/calendars')]);
       T=[];S=[];P={month,team_id:null,business_days:0,holidays:[],days:{},hours_per_day:C.hours_per_day};sel=null;tab='calc';await render();tourResume();return}
-    [T,G,S,P]=await Promise.all([J('/api/team?'+qs()),J('/api/genus'),J('/api/scenarios?'+qs()),J(`/api/period?month=${month}&${qs()}`)]);
+    [T,G,S,P]=await Promise.all([J('/api/team?'+qs()),J('/api/genus'+gq()),J('/api/scenarios?'+qs()),J(`/api/period?month=${month}&${qs()}`)]);
     sel=T[0]?.id;tab='calc';await render();tourResume()
   }catch(e){
     if(e!==0)console.error(e);
     if(!loginBusy&&!$('app').children.length)$('app').innerHTML=`<div class="panel load-error"><b>The calculator could not load</b><p class="mu">Check your connection and try again.</p><button class="btn primary" onclick="init()">Try again</button></div>`}}
 async function switchTeam(id,toTab){
   await flushAll();curTeam=id;store.set('mc_team',id);const m=P.month||thisMonth();
-  [TM,T,S,P]=await Promise.all([J('/api/teams?month='+m),J('/api/team?'+qs()),J('/api/scenarios?'+qs()),J(`/api/period?month=${m}&${qs()}`)]);
+  [TM,T,S,P,G]=await Promise.all([J('/api/teams?month='+m),J('/api/team?'+qs()),J('/api/scenarios?'+qs()),J(`/api/period?month=${m}&${qs()}`),J('/api/genus'+gq())]);
   sel=T[0]?.id;flt={q:'',lvl:'',br:'',band:'',warn:false};await go(toTab||tab)}
 
 /* ---- shell: every page is  header > (optional) context bar > panels ---- */

@@ -9,13 +9,16 @@ import openpyxl
 from . import calc, auth, feedback
 from .db import *
 import math
+from collections import Counter
 
 ROOT = Path(__file__).resolve().parent.parent          # the backend folder
 FRONTEND = Path(os.getenv("FRONTEND_DIR") or ROOT.parent / "frontend")   # the page, CSS and scripts (served at /static)
-DEFAULTS = {"currency": "INR", "unit_label": "per hour", "margin_warn_below": 20, "margin_good_from": 30, "hours_per_day": 8, "genus_change_flag_pct": 25,
+DEFAULTS = {"country": "India", "currency": "INR", "unit_label": "per hour", "margin_warn_below": 20, "margin_good_from": 30, "hours_per_day": 8, "genus_change_flag_pct": 25, "genus_approval": False,
             "max_rate": 100000, "max_genus": 100000, "max_exp": 60, "max_alloc": 1}
 CONFIG = {**DEFAULTS, **json.loads((ROOT / "config.json").read_text())}  # config.json may omit new keys
+DEFAULT_COUNTRY = CONFIG["country"]  # teams and Genus tables without a country belong here (its currency is CONFIG["currency"])
 SELF_APPROVE = os.getenv("ALLOW_SELF_APPROVAL") == "1"
+NEEDS_APPROVAL = bool(CONFIG["genus_approval"])  # False (default): an uploaded Genus table becomes active at once; True: it waits for a different admin (maker-checker)
 LEVELS = {"1.1", "2.1", "2.2", "2.3", "3.1", "3.2", "3.3", "4.1", "4.2", "4.3", "5.1", "5.2", "5.3"}
 def session_secret():
     """SESSION_SECRET if set, otherwise a random secret created once and kept in data/ (never a published default)."""
@@ -39,25 +42,83 @@ def read_rows(src):
     hdr = [str(h or "").strip().lower() for h in rows[0]]
     return [dict(zip(hdr, r)) for r in rows[1:] if any(c is not None for c in r)]
 
+CUR = re.compile(r"^[A-Z]{3}$")
+def clean_country(v): return " ".join(str(v or "").split())[:60]
+def same_country(a, b): return clean_country(a).casefold() == clean_country(b).casefold()
+
 def parse_genus(src):
-    ok, bad = {}, []
+    """Reads a Genus sheet: ServiceRegion, Country, ServiceLocation, Genus, Currency, Genus Cost.
+    Returns ({country: {"country", "currency", "rates": {key: (label, cost)}, "locations": {key: service location}}}, [(country, message), ...]).
+    One sheet may hold several countries. A sheet without Country / Currency columns (the older format) is the default country in the default currency."""
+    groups, bad = {}, []
     for i, r in enumerate(read_rows(src), start=2):
-        label = str(r.get("genus") or "").strip()
+        label = str(r.get("genus") or "").strip(); country = clean_country(r.get("country")) or DEFAULT_COUNTRY
+        loc = " ".join(str(r.get("servicelocation") or r.get("service location") or "").split())[:80]
+        g = groups.setdefault(country.casefold(), {"country": country, "rows": []})
+        cur = str(r.get("currency") or "").strip().upper()
+        if not cur and same_country(country, DEFAULT_COUNTRY): cur = CONFIG["currency"]
         try: cost = float(r.get("genus cost"))
-        except (TypeError, ValueError): bad.append(f"Row {i} ({label}): cost not a number"); continue
+        except (TypeError, ValueError): bad.append((g["country"], f"Row {i} ({label}): cost not a number")); continue
         m = re.match(r"^(\d\.\d)-(.+)$", label)
-        if not m or m.group(1) not in LEVELS: bad.append(f"Row {i} ({label}): bad Genus format or level"); continue
-        if cost <= 0: bad.append(f"Row {i} ({label}): cost must be > 0"); continue
-        k = calc.norm_role(label)
-        if k in ok: bad.append(f"Row {i} ({label}): duplicate key"); continue
-        ok[k] = (label, cost)
-    return ok, bad
+        if not m or m.group(1) not in LEVELS: bad.append((g["country"], f"Row {i} ({label}): bad Genus format or level")); continue
+        if not (cost > 0): bad.append((g["country"], f"Row {i} ({label}): cost must be > 0")); continue
+        if not cur: bad.append((g["country"], f"Row {i} ({label}): currency missing for {g['country']}")); continue
+        if not CUR.match(cur): bad.append((g["country"], f"Row {i} ({label}): currency must be a 3-letter code such as INR or EUR")); continue
+        g["rows"].append((i, label, cost, cur, loc))
+    out = {}
+    for k, g in groups.items():
+        if not g["rows"]: continue  # every row of this country was rejected: the reasons are in `bad`
+        cur = Counter(r[3] for r in g["rows"]).most_common(1)[0][0]; rt, lc = {}, {}
+        for i, label, cost, c, loc in g["rows"]:
+            if c != cur: bad.append((g["country"], f"Row {i} ({label}): currency {c} differs from {cur}, used by the other {g['country']} rows")); continue
+            key = calc.norm_role(label)
+            if key in rt: bad.append((g["country"], f"Row {i} ({label}): duplicate Genus for {g['country']}" + (f" (service location {loc})" if loc else "") + ", each Genus can appear once per country")); continue
+            rt[key] = (label, cost); lc[key] = loc
+        out[k] = {"country": g["country"], "currency": cur, "rates": rt, "locations": lc}
+    bad.sort(key=lambda x: int(re.match(r"Row (\d+)", x[1]).group(1)))
+    return out, bad
 
 def rates(db, vid): return {r.key: (r.label, r.cost) for r in db.query(GenusRate).filter_by(version_id=vid)}
-def active_version(db): return db.query(GenusVersion).filter_by(status="active").first()
-def genus_dict(db):
-    v = active_version(db)
+def tcountry(t): return (t.country if t is not None and t.country else None) or DEFAULT_COUNTRY
+def canon_country(db, name):
+    """The spelling already in use for this country (any capitals), otherwise the cleaned name."""
+    name = clean_country(name) or DEFAULT_COUNTRY
+    for (c,) in db.query(GenusVersion.country).distinct():
+        if c and c.casefold() == name.casefold(): return c
+    return name
+def active_version(db, country=None): return db.query(GenusVersion).filter_by(status="active", country=canon_country(db, country or DEFAULT_COUNTRY)).first()
+def genus_dict(db, country=None):
+    """The active Genus table of one country (the default country when none is given)."""
+    v = active_version(db, country)
     return {k: {"genus": l, "cost": c} for k, (l, c) in rates(db, v.id).items()} if v else {}
+def country_currency(db, country):
+    v = active_version(db, country)
+    return v.currency if v and v.currency else (CONFIG["currency"] if same_country(country, DEFAULT_COUNTRY) else None)
+def active_countries(db):
+    res = []
+    for v in db.query(GenusVersion).filter_by(status="active"):
+        res.append({"country": v.country or DEFAULT_COUNTRY, "currency": v.currency or CONFIG["currency"], "rows": db.query(GenusRate).filter_by(version_id=v.id).count(), "version_id": v.id})
+    return sorted(res, key=lambda c: (not same_country(c["country"], DEFAULT_COUNTRY), c["country"].casefold()))
+def need_country(db, name):
+    """A team's country must have an approved Genus table, because that table prices the team."""
+    c = canon_country(db, name) if name else DEFAULT_COUNTRY
+    if not active_version(db, c): raise HTTPException(400, f"There is no approved Genus table for {c} yet. An administrator must approve one first.")
+    return c
+def ranges_for(db, country):
+    """Slider ranges for a team. The default currency keeps the classic ranges (None); any other currency is scaled from that country's own table."""
+    v = active_version(db, country); cur = country_currency(db, country)
+    if not v or cur in (None, CONFIG["currency"]): return None
+    cs = sorted(c for _, c in rates(db, v.id).values())
+    if not cs: return None
+    step = 10 ** (math.floor(math.log10(cs[-1])) - 2); up = lambda x: round(math.ceil(x / step - 1e-9) * step, 6); dn = lambda x: round(math.floor(x / step) * step, 6)
+    glo, ghi = dn(cs[0] * 0.5), up(cs[-1] * 1.3)
+    return {"genus": [glo, ghi, round(step, 6)], "rate": [glo, up(ghi * 1.5), round(step, 6)]}
+def new_person_defaults(db, t):
+    """Starting rate and Genus cost for 'Add person'. Unchanged for the default currency; otherwise the middle of the country's own table at a 28% margin."""
+    v = active_version(db, tcountry(t))
+    if not v or country_currency(db, tcountry(t)) in (None, CONFIG["currency"]): return 2500, 1800
+    cs = sorted(c for _, c in rates(db, v.id).values()); g = cs[len(cs) // 2]
+    return round(g / 0.72, 2), g
 
 BRACKETS = ("3-6", "6-9", "9-12", "12-15")
 def iso(d): return d.isoformat() if d else None
@@ -232,7 +293,8 @@ def period(month: str, team_id: int | None = None, u=ANY, db=Depends(get_db)):
     y, m = month_field(month); t = team_for(db, u, team_id); hs = holiday_set(db, t.calendar_id)
     n, hl = calc.business_days(y, m, hs)
     days = {l.id: calc.person_days(y, m, hs, l.start_date, l.end_date) for l in lines(db, t)}  # per person: honours start / end dates
-    return {"month": month, "team_id": t.id, "business_days": n, "holidays": hl, "hours_per_day": CONFIG["hours_per_day"], "days": days}
+    c = tcountry(t); return {"month": month, "team_id": t.id, "business_days": n, "holidays": hl, "hours_per_day": CONFIG["hours_per_day"], "days": days,
+                             "country": c, "currency": country_currency(db, c) or CONFIG["currency"], "ranges": ranges_for(db, c)}
 
 # ---------- holiday calendars (regional) ----------
 @app.get("/api/calendars")
@@ -279,7 +341,7 @@ def teams(month: str | None = None, u=ANY, db=Depends(get_db)):
     y, m = month_field(month or cur_month()); res = []
     for t in visible_teams(db, u):
         ls = lines(db, t); r = calc.month_rollup(line_rows(ls, holiday_set(db, t.calendar_id), y, m), CONFIG["hours_per_day"])
-        cal = db.get(Calendar, t.calendar_id); d = {"id": t.id, "name": t.name, "unit": t.unit or "", "simulated": bool(t.simulated), "private": bool(t.private), "mine": t.created_by == u.email, "can_edit": can_write(db, u, t.id), "owner": t.created_by if "@" in (t.created_by or "") else "", "calendar_id": t.calendar_id, "calendar": cal.name if cal else "", "people": len(ls), "headcount": r["headcount"], "revenue": r["revenue"], "cost": r["cost"], "margin": r["margin"], "margin_pct": r["margin_pct"], "band": band_of(r["margin_pct"])}
+        cal = db.get(Calendar, t.calendar_id); d = {"id": t.id, "name": t.name, "unit": t.unit or "", "country": tcountry(t), "currency": country_currency(db, tcountry(t)) or CONFIG["currency"], "simulated": bool(t.simulated), "private": bool(t.private), "mine": t.created_by == u.email, "can_edit": can_write(db, u, t.id), "owner": t.created_by if "@" in (t.created_by or "") else "", "calendar_id": t.calendar_id, "calendar": cal.name if cal else "", "people": len(ls), "headcount": r["headcount"], "revenue": r["revenue"], "cost": r["cost"], "margin": r["margin"], "margin_pct": r["margin_pct"], "band": band_of(r["margin_pct"])}
         res.append(d)
     return res
 @app.post("/api/teams")
@@ -288,7 +350,9 @@ def team_create(b: dict, u=MGR, db=Depends(get_db)):
     if any(x.name.lower() == name.lower() for x in visible_teams(db, u)): raise HTTPException(400, "You already have a team with this name")
     cal = cal_or_404(db, b.get("calendar_id")); unit = text_field(b.get("unit") or "", "Business unit", 60); private = b.get("private") is True
     src = team_for(db, u, b["copy_from"]) if b.get("copy_from") else None  # you can only copy from a team you can see
-    t = Team(name=name, calendar_id=cal.id, unit=unit or None, created_by=u.email, private=private); db.add(t); db.commit()
+    country = need_country(db, b.get("country"))
+    if src and not same_country(tcountry(src), country): raise HTTPException(400, f"You can only copy people from a team in {country}: rates and costs in another country use another currency.")
+    t = Team(name=name, calendar_id=cal.id, unit=unit or None, created_by=u.email, private=private, country=country); db.add(t); db.commit()
     if u.role != "admin" or private: db.add(TeamAccess(user_id=u.id, team_id=t.id)); db.commit()  # the creator keeps access to what they create
     copied = 0
     if src:  # start from another team's people
@@ -296,7 +360,7 @@ def team_create(b: dict, u=MGR, db=Depends(get_db)):
         for i, l in enumerate(lines(db, src)):
             db.add(TeamLine(id=uuid.uuid4().hex[:8], pos=top + i, team_id=t.id, **{k: getattr(l, k) for k in ["name", "role", "exp", "rate", "bracket", "bracket_override", "genus", "genus_override", "alloc", "base", "warnings", "start_date", "end_date"]})); copied += 1
         db.commit()
-    log(db, u, "team_add", "team", t.id, {"name": name, "calendar": cal.name, "copied_people": copied, "private": private}, team=t); return {"id": t.id}
+    log(db, u, "team_add", "team", t.id, {"name": name, "calendar": cal.name, "country": country, "copied_people": copied, "private": private}, team=t); return {"id": t.id}
 SAMPLE_PEOPLE = [("3.1-Java", 5.5, 2450), ("3.2-Java", 8, 2720), ("3.3-Java", 10.5, 2900), ("3.1-Devops", 6, 2450), ("2.3-Custom", 4.5, 2300), ("3.2-CRM-SALESFORCE", 7.5, 2700), ("3.1-Python", 5, 2400), ("3.2-Data-Science", 8.5, 2760)]
 @app.post("/api/teams/sample")
 def team_sample(u=MGR, db=Depends(get_db)):
@@ -305,7 +369,7 @@ def team_sample(u=MGR, db=Depends(get_db)):
     while name.lower() in mine: n += 1; name = f"Sample team {n}"
     cal = db.query(Calendar).order_by(Calendar.id).first()
     if not cal: raise HTTPException(400, "No holiday calendar exists yet. Ask an administrator.")
-    t = Team(name=name, calendar_id=cal.id, created_by=u.email, simulated=True); db.add(t); db.commit()
+    t = Team(name=name, calendar_id=cal.id, created_by=u.email, simulated=True, country=DEFAULT_COUNTRY); db.add(t); db.commit()
     if u.role != "admin": db.add(TeamAccess(user_id=u.id, team_id=t.id)); db.commit()
     g, top = genus_dict(db), db.query(TeamLine).count()
     for i, (role, exp, rate) in enumerate(SAMPLE_PEOPLE):
@@ -337,6 +401,8 @@ def team_edit(tid: int, b: dict, u=MGR, db=Depends(get_db)):
         if t.created_by != u.email: raise HTTPException(403, "Only the person who created a team can change its privacy.")
         t.private = b["private"] is True; ch["private"] = [not t.private, t.private]
         if t.private and not db.query(TeamAccess).filter_by(user_id=u.id, team_id=t.id).first(): db.add(TeamAccess(user_id=u.id, team_id=t.id))
+    if "country" in b and b["country"] and not same_country(b["country"], tcountry(t)):
+        c = need_country(db, b["country"]); ch["country"] = [tcountry(t), c]; t.country = c  # rates and costs already in the team are NOT converted
     if "calendar_id" in b and b["calendar_id"] != t.calendar_id:
         cal = cal_or_404(db, b["calendar_id"]); ch["calendar"] = [t.calendar_id, cal.id]; t.calendar_id = cal.id
     if ch: db.commit(); log(db, u, "team_edit", "team", t.id, ch, team=t)
@@ -388,8 +454,8 @@ def team(team_id: int | None = None, u=ANY, db=Depends(get_db)): return [out(m) 
 FIELDS = ["name", "role", "exp", "rate", "bracket", "bracket_override", "genus", "genus_override", "alloc", "start_date", "end_date"]
 @app.post("/api/team")
 def team_add(team_id: int | None = None, u=MGR, db=Depends(get_db)):
-    t = team_for(db, u, team_id, True); n = (db.query(TeamLine).count()); b = dict(rate=2500, exp=5, genus=1800, bracket="3-6")
-    m = TeamLine(id=uuid.uuid4().hex[:8], pos=n, team_id=t.id, name="New person", role="", rate=2500, exp=5, bracket="3-6", genus=1800, genus_override=True, alloc=1, base=b, warnings=[])
+    t = team_for(db, u, team_id, True); n = (db.query(TeamLine).count()); rate0, genus0 = new_person_defaults(db, t); b = dict(rate=rate0, exp=5, genus=genus0, bracket="3-6")
+    m = TeamLine(id=uuid.uuid4().hex[:8], pos=n, team_id=t.id, name="New person", role="", rate=rate0, exp=5, bracket="3-6", genus=genus0, genus_override=True, alloc=1, base=b, warnings=[])
     db.add(m); db.commit(); log(db, u, "person_add", "team", m.id, {"team": t.name}, team=t); return out(m)
 @app.patch("/api/team/{pid}")
 def team_patch(pid: str, b: dict, u=MGR, db=Depends(get_db)):
@@ -414,7 +480,7 @@ def team_restore(pid: str, team_id: int | None = None, u=MGR, db=Depends(get_db)
     """Brings a removed person back with their original numbers, dates and baseline (same id, so saved scenarios line up again)."""
     t = team_for(db, u, team_id, True); gone = list(t.removed or []); r = next((x for x in gone if x["id"] == pid), None)
     if not r or db.get(TeamLine, pid): raise HTTPException(404, "That person was not removed from this team")
-    g = genus_dict(db).get(calc.norm_role(r.get("role") or ""))
+    g = genus_dict(db, tcountry(t)).get(calc.norm_role(r.get("role") or ""))
     m = TeamLine(id=pid, pos=db.query(TeamLine).count(), team_id=t.id, name=r["name"], role=r.get("role") or "", exp=r["exp"], rate=r["rate"], bracket=r["bracket"],
                  bracket_override=r.get("bracket_override", r["bracket"] != calc.bracket(r["exp"])), genus=r["genus"],
                  genus_override=r.get("genus_override", not (g and abs(g["cost"] - r["genus"]) < 0.005)), alloc=r.get("alloc", 1), base=r["base"], warnings=r.get("warnings") or [],
@@ -423,14 +489,16 @@ def team_restore(pid: str, team_id: int | None = None, u=MGR, db=Depends(get_db)
 @app.post("/api/team/import")
 async def team_import(file: UploadFile = File(...), team_id: int | None = None, u=MGR, db=Depends(get_db)):
     t = team_for(db, u, team_id, True)
-    ms = import_team(io.BytesIO(await file.read()), genus_dict(db)); replace_team(db, ms, t.id)
+    ms = import_team(io.BytesIO(await file.read()), genus_dict(db, tcountry(t))); replace_team(db, ms, t.id)
     log(db, u, "team_import", "team", t.id, {"team": t.name, "rows": len(ms), "file": file.filename}, team=t); return team(t.id, u, db)
 @app.post("/api/team/reprice")
 def reprice(team_id: int | None = None, u=MGR, db=Depends(get_db)):
-    """Re-prices every team you can see (the Genus table is shared), or just team_id."""
-    g, n = genus_dict(db), 0
+    """Re-prices every team you can see, or just team_id. Each team is priced from the active Genus table of its own country."""
+    n, cache = 0, {}
     ids = [team_for(db, u, team_id, True).id] if team_id else [t.id for t in visible_teams(db, u) if can_write(db, u, t.id)]
+    owner = {t.id: tcountry(t) for t in db.query(Team).filter(Team.id.in_(ids or [-1]))}
     for m in db.query(TeamLine).filter(TeamLine.team_id.in_(ids or [-1])):
+        c = owner.get(m.team_id, DEFAULT_COUNTRY); g = cache.get(c) or cache.setdefault(c, genus_dict(db, c))
         x = g.get(calc.norm_role(m.role))
         if x and not m.genus_override and abs(x["cost"] - m.genus) > 0.005:
             m.genus = x["cost"]; m.base = {**m.base, "genus": x["cost"]}; n += 1
@@ -474,8 +542,7 @@ def scen_del(sid: int, u=MGR, db=Depends(get_db)):
     return {"ok": True}
 @app.post("/api/scenarios/{sid}/apply")
 def scen_apply(sid: int, backup: bool = True, u=MGR, db=Depends(get_db)):
-    s, g = scen_for(db, u, sid, True), genus_dict(db)
-    t = team_for(db, u, s.team_id)
+    s = scen_for(db, u, sid, True); t = team_for(db, u, s.team_id); g = genus_dict(db, tcountry(t))
     bk = make_scenario(db, t, u, f"Before loading “{s.name}”", auto=True) if backup else None  # safety net: Undo = load this backup
     for v in s.data["vals"]:
         m = db.get(TeamLine, v["id"])
@@ -514,39 +581,66 @@ def scen_compare(a: str, b: str, team_id: int | None = None, month: str | None =
     ra, rb = calc.month_rollup(ta, CONFIG["hours_per_day"]), calc.month_rollup(tb, CONFIG["hours_per_day"])
     return {"a": {"name": na, **ra}, "b": {"name": nb, **rb}, "rows": rows, "month": f"{y}-{mo:02d}"}
 
-# ---------- Genus versions: upload -> pending -> admin approves (maker-checker) -> active; rollback = re-activate ----------
+# ---------- Genus versions: upload -> pending -> admin approves (maker-checker) -> active; rollback = re-activate.
+# Every country has its own table in its own currency: approving a version replaces only that country's active table. ----------
 @app.get("/api/genus")
-def genus(u=MGR, db=Depends(get_db)): return genus_dict(db)
+def genus(team_id: int | None = None, country: str | None = None, u=MGR, db=Depends(get_db)):
+    """The active table used by a team (team_id), or by a country, or by the default country."""
+    c = tcountry(team_for(db, u, team_id)) if team_id else (canon_country(db, country) if country else DEFAULT_COUNTRY)
+    return genus_dict(db, c)
+@app.get("/api/genus/countries")
+def genus_countries(u=ANY, db=Depends(get_db)): return active_countries(db)
 @app.get("/api/genus/versions")
 def versions(u=MGR, db=Depends(get_db)):
-    return [{"id": v.id, "label": v.label, "status": v.status, "by": v.created_by, "at": v.created_at.isoformat(), "decided_by": v.decided_by, "rows": db.query(GenusRate).filter_by(version_id=v.id).count(), "report": v.report}
+    return [{"id": v.id, "label": v.label, "status": v.status, "by": v.created_by, "at": v.created_at.isoformat(), "decided_by": v.decided_by, "rows": db.query(GenusRate).filter_by(version_id=v.id).count(), "report": v.report,
+             "country": v.country or DEFAULT_COUNTRY, "currency": v.currency or CONFIG["currency"], "locations": (v.report or {}).get("locations", [])}
             for v in db.query(GenusVersion).order_by(GenusVersion.id.desc())]
+def activate(db, v, u, was):
+    """Makes version v the active table of its country (the current one is archived) and counts team lines whose table cost changed."""
+    country = v.country or DEFAULT_COUNTRY; act = active_version(db, country)
+    if act and act.id != v.id: act.status = "archived"  # only this country's table is replaced
+    v.status, v.decided_by, v.decided_at = "active", u.email, now(); db.commit()
+    g = genus_dict(db, country); tids = [t.id for t in db.query(Team) if same_country(tcountry(t), country)]
+    stale = sum(1 for m in db.query(TeamLine).filter(TeamLine.team_id.in_(tids or [-1])) if (x := g.get(calc.norm_role(m.role))) and not m.genus_override and abs(x["cost"] - m.genus) > 0.005)
+    log(db, u, "genus_rollback" if was == "archived" else "genus_approve", "genus_version", v.id, {"label": v.label, "country": country, "team_lines_with_new_cost": stale, "auto": was == "pending"}); return stale
 @app.post("/api/genus/upload")
 async def genus_upload(file: UploadFile = File(...), u=MGR, db=Depends(get_db)):
-    ok, bad = parse_genus(io.BytesIO(await file.read()))
-    if not ok: raise HTTPException(400, "No valid rows. " + "; ".join(bad[:5]))
-    v = GenusVersion(label=file.filename, status="pending", created_by=u.email, report={"accepted": len(ok), "rejected": bad[:50], "rejected_count": len(bad)})
-    db.add(v); db.commit()
-    for k, (l, c) in ok.items(): db.add(GenusRate(version_id=v.id, key=k, label=l, cost=c))
-    db.commit(); log(db, u, "genus_upload", "genus_version", v.id, v.report); return {"id": v.id, **v.report}
+    groups, bad = parse_genus(io.BytesIO(await file.read())); made = []
+    for g in groups.values():
+        country = canon_country(db, g["country"]); last = db.query(GenusVersion).filter(GenusVersion.country == country, GenusVersion.currency.isnot(None)).order_by(GenusVersion.id.desc()).first()
+        if last and last.currency != g["currency"]:  # a country keeps its currency: a different one would silently corrupt every team priced from it
+            bad += [(g["country"], f"{lbl}: {country} is priced in {last.currency}, but this sheet says {g['currency']}") for lbl, _ in g["rates"].values()]; continue
+        mine = [m for c, m in bad if c.casefold() == g["country"].casefold()]
+        report = {"accepted": len(g["rates"]), "rejected": mine[:50], "rejected_count": len(mine), "country": country, "currency": g["currency"], "locations": sorted({x for x in g["locations"].values() if x})}
+        v = GenusVersion(label=file.filename, status="pending", country=country, currency=g["currency"], created_by=u.email, report=report)
+        db.add(v); db.commit()
+        for k, (l, c) in g["rates"].items(): db.add(GenusRate(version_id=v.id, key=k, label=l, cost=c, location=g["locations"].get(k) or None))
+        db.commit(); log(db, u, "genus_upload", "genus_version", v.id, report)
+        stale = None if NEEDS_APPROVAL else activate(db, v, u, "pending")  # no approval step: the upload is live straight away
+        made.append({"id": v.id, "country": country, "currency": g["currency"], "accepted": len(g["rates"]), "rejected_count": len(mine), "status": v.status, "stale_lines": stale})
+    allbad = [m for _, m in bad]
+    if not made: raise HTTPException(400, "No valid rows. " + "; ".join(allbad[:5]))
+    return {"id": made[0]["id"], "accepted": sum(m["accepted"] for m in made), "rejected": allbad[:50], "rejected_count": len(allbad), "versions": made, "approval_required": NEEDS_APPROVAL,
+            "stale_lines": sum(m["stale_lines"] or 0 for m in made)}
 @app.get("/api/genus/versions/{vid}/diff")
 def diff(vid: int, u=MGR, db=Depends(get_db)):
-    new, act = rates(db, vid), active_version(db); old = rates(db, act.id) if act else {}; th = CONFIG["genus_change_flag_pct"]
+    v = db.get(GenusVersion, vid)
+    if not v: raise HTTPException(404, "Version not found")
+    new, act = rates(db, vid), active_version(db, v.country); old = rates(db, act.id) if act else {}; th = CONFIG["genus_change_flag_pct"]
     ch = [{"key": new[k][0], "old": old[k][1], "new": new[k][1], "pct": round((new[k][1] - old[k][1]) / old[k][1] * 100, 1)} for k in new if k in old and abs(new[k][1] - old[k][1]) > 0.005]
     for c in ch: c["flag"] = abs(c["pct"]) > th
-    return {"added": [new[k][0] for k in new if k not in old], "removed": [old[k][0] for k in old if k not in new], "changed": sorted(ch, key=lambda c: -abs(c["pct"]))}
+    return {"country": v.country or DEFAULT_COUNTRY, "currency": v.currency or CONFIG["currency"], "added": [new[k][0] for k in new if k not in old], "removed": [old[k][0] for k in old if k not in new], "changed": sorted(ch, key=lambda c: -abs(c["pct"]))}
 @app.post("/api/genus/versions/{vid}/approve")
-def approve(vid: int, u=ADM, db=Depends(get_db)):
+def approve(vid: int, u=MGR, db=Depends(get_db)):
     v = db.get(GenusVersion, vid)
     if not v or v.status not in ("pending", "archived"): raise HTTPException(400, "Version cannot be activated")
-    if v.status == "pending" and v.created_by == u.email and not SELF_APPROVE: raise HTTPException(403, "A different admin must approve your upload")
-    act, was = active_version(db), v.status
-    if act: act.status = "archived"
-    v.status, v.decided_by, v.decided_at = "active", u.email, now(); db.commit()
-    g = genus_dict(db); stale = sum(1 for m in db.query(TeamLine) if (x := g.get(calc.norm_role(m.role))) and not m.genus_override and abs(x["cost"] - m.genus) > 0.005)
-    log(db, u, "genus_rollback" if was == "archived" else "genus_approve", "genus_version", vid, {"label": v.label, "team_lines_with_new_cost": stale}); return {"ok": True, "stale_lines": stale}
+    if NEEDS_APPROVAL and u.role != "admin": raise HTTPException(403, "Only an administrator can approve a Genus table")
+    if NEEDS_APPROVAL and v.status == "pending" and v.created_by == u.email and not SELF_APPROVE: raise HTTPException(403, "A different admin must approve your upload")
+    country = v.country or DEFAULT_COUNTRY; stale = activate(db, v, u, v.status)
+    return {"ok": True, "stale_lines": stale, "country": country}
 @app.post("/api/genus/versions/{vid}/reject")
-def reject(vid: int, u=ADM, db=Depends(get_db)):
+def reject(vid: int, u=MGR, db=Depends(get_db)):
+    if NEEDS_APPROVAL and u.role != "admin": raise HTTPException(403, "Only an administrator can reject a Genus table")
     v = db.get(GenusVersion, vid)
     if not v or v.status != "pending": raise HTTPException(400)
     v.status, v.decided_by, v.decided_at = "rejected", u.email, now(); db.commit(); log(db, u, "genus_reject", "genus_version", vid); return {"ok": True}
@@ -635,7 +729,7 @@ def mix(b: dict, u=MGR, db=Depends(get_db)):
     if act != "add" and not old: raise HTTPException(404, "Person not found in this team")
     new = None
     if act != "remove":
-        role = text_field(b.get("role"), "Role", required=True); g = genus_dict(db).get(calc.norm_role(role))
+        role = text_field(b.get("role"), "Role", required=True); g = genus_dict(db, tcountry(t)).get(calc.norm_role(role))
         cost = num(b["genus_override"], "Genus cost", gt=0, hi=CONFIG["max_genus"]) if b.get("genus_override") not in (None, "") else (g["cost"] if g else None)
         if cost is None: raise HTTPException(400, f"Role '{role}' is not in the Genus table. Enter a Genus cost.")
         alloc = num(b.get("alloc", old["alloc"] if old else 1), "Allocation", gt=0, hi=CONFIG["max_alloc"])
@@ -646,6 +740,8 @@ def mix(b: dict, u=MGR, db=Depends(get_db)):
 @app.on_event("startup")
 def seed():
     legacy = ensure_schema(); db = SessionLocal()
+    db.query(GenusVersion).filter(GenusVersion.country.is_(None)).update({"country": DEFAULT_COUNTRY, "currency": CONFIG["currency"]})  # tables and teams from before countries existed
+    db.query(Team).filter(Team.country.is_(None)).update({"country": DEFAULT_COUNTRY}); db.commit()
     if auth.MODE == "dev" and not db.query(User).count():
         for e, r in (("admin@local", "admin"), ("admin2@local", "admin"), ("manager@local", "manager")): db.add(User(email=e, name=e, role=r))
     for e in re.split(r"[,\s;]+", (os.getenv("ADMIN_EMAILS", "") + "," + os.getenv("FIRST_ADMIN_EMAIL", "")).lower()):  # administrators are named here, never self-registered
@@ -654,9 +750,11 @@ def seed():
         if x: x.role, x.active = "admin", True
         else: db.add(User(email=e, name=e.split("@")[0], role="admin"))
     if not db.query(GenusVersion).count():
-        ok, _ = parse_genus(ROOT / "data/Genus_Cost.xlsx"); v = GenusVersion(label="Initial table (SIMULATED, unverified)", status="active", created_by="system", decided_by="system", decided_at=now(), report={"accepted": len(ok)})
-        db.add(v); db.commit()
-        for k, (l, c) in ok.items(): db.add(GenusRate(version_id=v.id, key=k, label=l, cost=c))
+        groups, _ = parse_genus(ROOT / "data/Genus_Cost.xlsx")
+        for g in groups.values():
+            v = GenusVersion(label="Initial table (SIMULATED, unverified)", status="active", country=g["country"], currency=g["currency"], created_by="system", decided_by="system", decided_at=now(), report={"accepted": len(g["rates"])})
+            db.add(v); db.commit()
+            for k, (l, c) in g["rates"].items(): db.add(GenusRate(version_id=v.id, key=k, label=l, cost=c, location=g["locations"].get(k) or None))
     if not db.query(Calendar).count():  # first start, or upgrade from the single global calendar
         cal = Calendar(name="India (national)"); db.add(cal); db.commit()
         legacy = db.query(Holiday).all()
@@ -667,7 +765,7 @@ def seed():
                 for md, n in (("01-26", "Republic Day"), ("08-15", "Independence Day"), ("10-02", "Gandhi Jayanti"), ("12-25", "Christmas")): db.add(CalendarDay(calendar_id=cal.id, day=dt.date.fromisoformat(f"{y}-{md}"), name=n))
     db.commit()
     if not db.query(Team).count():
-        t = Team(name="Main team", calendar_id=db.query(Calendar).order_by(Calendar.id).first().id, created_by="system"); db.add(t); db.commit()
+        t = Team(name="Main team", calendar_id=db.query(Calendar).order_by(Calendar.id).first().id, created_by="system", country=DEFAULT_COUNTRY); db.add(t); db.commit()
     for x in db.query(User).filter_by(role="delivery"):  # the delivery role was removed: keep the account, but with no team access until an admin assigns teams again
         x.role = "manager"; db.query(TeamAccess).filter_by(user_id=x.id).delete()
     db.commit()
@@ -682,6 +780,7 @@ def seed():
     if auth.MODE in ("dev", "email") and os.getenv("DEMO_DATA", "1") != "0":  # simulated teams: local testing only, never in SSO / production mode
         from .demo_data import seed_demo, ensure_demo_accounts
         seed_demo(db, genus_dict(db)); ensure_demo_accounts(db)
+        db.query(Team).filter(Team.country.is_(None)).update({"country": DEFAULT_COUNTRY}); db.commit()
     db.close()
 
 class Static(StaticFiles):

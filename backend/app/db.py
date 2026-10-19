@@ -19,10 +19,12 @@ class GenusVersion(Base):
     id = Column(Integer, primary_key=True); label = Column(String); status = Column(String, default="pending")  # pending|active|archived|rejected
     created_by = Column(String); created_at = Column(DateTime, default=now); decided_by = Column(String); decided_at = Column(DateTime)
     source_status = Column(String, default="unverified"); report = Column(JSON)
+    country = Column(String, index=True); currency = Column(String)  # each country keeps its own Genus table, in its own currency; one version per country is active
 class GenusRate(Base):
     __tablename__ = "genus_rates"
     id = Column(Integer, primary_key=True); version_id = Column(Integer, ForeignKey("genus_versions.id"), index=True)
     key = Column(String, index=True); label = Column(String); cost = Column(Float)
+    location = Column(String)  # ServiceLocation column of the Genus sheet (informational; a Genus is priced once per country)
 class Calendar(Base):
     __tablename__ = "calendars"
     id = Column(Integer, primary_key=True); name = Column(String, unique=True)
@@ -38,6 +40,7 @@ class Team(Base):
     simulated = Column(Boolean, default=False)  # demo data, shown with a "Simulated" tag
     removed = Column(JSON)                      # people deleted from this team (numbers kept so Compare can still show them); cleared when the team sheet is re-imported
     private = Column(Boolean, default=False)    # True = administrators cannot see this team unless given access
+    country = Column(String)                    # which country's Genus table prices this team (and so its currency); empty = the default country
 class TeamAccess(Base):  # who may see which team (admins see every non-private team and need no rows)
     __tablename__ = "team_access"
     edit = Column(Boolean, default=True)  # False = shared as view only
@@ -82,7 +85,7 @@ def ensure_schema():
     Base.metadata.create_all(engine)
     insp = inspect(engine)
     adds = {"team_lines": [("team_id", "INTEGER"), ("start_date", "DATE"), ("end_date", "DATE")], "scenarios": [("team_id", "INTEGER"), ("auto", "BOOLEAN")],
-            "teams": [("unit", "VARCHAR"), ("simulated", "BOOLEAN"), ("removed", "JSON"), ("private", "BOOLEAN")], "audit": [("hidden", "BOOLEAN")], "team_access": [("edit", "BOOLEAN")]}
+            "teams": [("unit", "VARCHAR"), ("simulated", "BOOLEAN"), ("removed", "JSON"), ("private", "BOOLEAN"), ("country", "VARCHAR")], "genus_versions": [("country", "VARCHAR"), ("currency", "VARCHAR")], "genus_rates": [("location", "VARCHAR")], "audit": [("hidden", "BOOLEAN")], "team_access": [("edit", "BOOLEAN")]}
     with engine.begin() as c:
         for t, cols in adds.items():
             have = {x["name"] for x in insp.get_columns(t)}

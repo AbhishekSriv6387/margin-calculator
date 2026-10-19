@@ -4,7 +4,9 @@
 const $=id=>document.getElementById(id);
 const nk=s=>(s||'').replace(/\s+/g,'').toUpperCase();
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const f=(n,d=0)=>n==null?'–':Number(n).toLocaleString('en-IN',{maximumFractionDigits:d,minimumFractionDigits:d});
+/* money style follows the open team's currency: INR keeps Indian grouping (lakh / crore); every other currency uses 1,234,567.89 and shows cents on small amounts */
+const ccy=()=>{try{return P?.currency||C?.currency||'INR'}catch(e){return 'INR'}};
+const f=(n,d=0)=>n==null?'–':Number(n).toLocaleString(ccy()==='INR'?'en-IN':'en-US',{maximumFractionDigits:d==0&&ccy()!=='INR'&&Math.abs(n)<1000?2:d,minimumFractionDigits:d});
 const J=(u,o={})=>fetch(u,{headers:{'Content-Type':'application/json'},...o}).then(async r=>{
   if(r.status==401){showLogin();throw 0}
   if(!r.ok){const d=(await r.json().catch(()=>({}))).detail;toast(typeof d=='string'?d:'Something went wrong. Please try again.','err');throw 0}
@@ -86,7 +88,10 @@ const teamSelect=()=>{
   const g={};TM.forEach(t=>(g[t.unit||'']=g[t.unit||'']||[]).push(t));
   const opt=t=>`<option value="${t.id}" ${t.id==curTeam?'selected':''}>${esc(t.name)}</option>`,keys=Object.keys(g).sort((a,b)=>(a===''?1:0)-(b===''?1:0)||a.localeCompare(b));
   const body=keys.length==1&&keys[0]===''?TM.map(opt).join(''):keys.map(k=>`<optgroup label="${esc(k||'No business unit')}">${g[k].map(opt).join('')}</optgroup>`).join('');
-  return `<label class="inline-field" for="tsel"><span>Team</span><select id="tsel" class="auto" onchange="switchTeam(+this.value)">${body}</select></label>`};
+  return `<label class="inline-field" for="tsel"><span>Team</span><select id="tsel" class="auto" onchange="switchTeam(+this.value)">${body}</select></label>${ccyTag(TM.find(t=>t.id==curTeam))}`};
+/* which country's Genus table prices a team, and the currency its figures are in */
+const ccyTag=t=>t?`<span class="tag ccy" title="Priced from the ${esc(t.country)} Genus table. All figures are in ${esc(t.currency)}.">${esc(t.country)} · ${esc(t.currency)}</span>`:'';
+const gq=()=>curTeam==null?'':'?'+qs();   /* the Genus table of the open team (its country's table) */
 /* chart colour per margin band (muted, one family; tokens live in :root) */
 const colOf=b=>({loss:'var(--bar-loss)',red:'var(--bar-low)',amber:'var(--bar-mid)',green:'var(--bar-good)'}[b]||'var(--bar-neutral)');
 /* change vs a reference: signed number, signed percentage points, and the text colour class for it */
@@ -95,8 +100,10 @@ const dpts=v=>v==null?'–':(v>0?'+':v<0?'\u2212':'')+f(Math.abs(v),2)+' pts';
 const dcls=v=>v==null||Math.abs(v)<1e-9?'':v>0?'green':'red';
 const pct2=v=>v==null?'–':f(v,2)+'%';   /* margin % to two decimals, used by Insights */
 /* compact money for charts: lakh / crore, matching en-IN number style */
-const short=v=>{const a=Math.abs(v),s=v<0?'-':'';return a>=1e7?s+f(a/1e7,2)+' Cr':a>=1e5?s+f(a/1e5,1)+' L':s+f(a)};
-const rngs={rate:[500,6000,10],genus:[500,4000,10],exp:[0,20,0.1]};
+const short=v=>{const a=Math.abs(v),s=v<0?'-':'';if(ccy()!=='INR')return a>=1e9?s+f(a/1e9,2)+' B':a>=1e6?s+f(a/1e6,2)+' M':a>=1e3?s+f(a/1e3,1)+' K':s+f(a);return a>=1e7?s+f(a/1e7,2)+' Cr':a>=1e5?s+f(a/1e5,1)+' L':s+f(a)};
+/* slider ranges: the classic ones for INR; for other currencies the server sends ranges scaled from that country's own Genus table */
+const RNG0={rate:[500,6000,10],genus:[500,4000,10],exp:[0,20,0.1]};
+const rngs={get rate(){return P?.ranges?.rate||RNG0.rate},get genus(){return P?.ranges?.genus||RNG0.genus},exp:RNG0.exp};
 const mg=(r,g)=>({a:r-g,p:r?(r-g)/r*100:null});
 const bandOf=p=>p==null?'red':p<0?'loss':p<C.margin_warn_below?'red':p<C.margin_good_from?'amber':'green';
 const BL={loss:'Loss',red:'Low',amber:'Medium',green:'Good'};

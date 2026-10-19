@@ -3988,3 +3988,6 @@ body.ro .need-edit {
     display: none
   }
 }
+/* country / currency chips and per-currency totals */
+.tag.ccy { align-self: center; white-space: nowrap; }
+em.cc { font-style: normal; font-size: .55em; font-weight: 600; opacity: .65; margin-left: .25em; }
